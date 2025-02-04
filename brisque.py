@@ -1,0 +1,1 @@
+#python inference_iqa.py - m brisque - t. / ResultsCalibra / dist_dir / I03.bmp
