@@ -348,8 +348,78 @@ class SCAModule(nn.Module):
         attention = torch.sigmoid(x)
         return x * attention  # [B, C, H, W]
 
+
+class SKConvNoFC(nn.Module):
+    def __init__(self, in_channels, reduction=16, L=32):
+        super(SKConvNoFC, self).__init__()
+
+        # 尝试减少卷积核大小，改为 1×1 来减少显存消耗
+        self.conv1x1 = nn.Conv2d(in_channels, in_channels, kernel_size=1, padding=0, stride=1)
+
+        d = max(L, in_channels // reduction)
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+
+        # 用 1×1 卷积代替 FC
+        self.conv1 = nn.Conv2d(in_channels, d, kernel_size=1)
+        self.conv2 = nn.Conv2d(d, in_channels * 2, kernel_size=1)
+
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        # 使用较小的卷积核
+        feat1x1 = self.conv1x1(x)  # 1×1 卷积
+        u = feat1x1  # 你可以在这里加入不同尺度的特征融合策略
+
+        s = self.global_pool(u)  # 全局池化 [B, C, 1, 1]
+        s = F.relu(self.conv1(s))  # 用 1×1 卷积降维
+        a = self.softmax(self.conv2(s).view(s.size(0), 2, -1))  # 用 1×1 卷积升维
+
+        # 加权组合不同感受野的特征
+        return feat1x1 * a[:, 0, :].view(a.size(0), -1, 1, 1) + feat1x1 * a[:, 1, :].view(a.size(0), -1, 1, 1)
+
+class SCNet(nn.Module):
+    def __init__(self, in_channels, reduction=16, L=32):
+        super(SCNet, self).__init__()
+        # 尝试减少卷积核大小，改为 1×1 来减少显存消耗
+        self.conv1x1 = nn.Conv2d(in_channels, in_channels, kernel_size=1, padding=0, stride=1)
+
+        d = max(L, in_channels // reduction)
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+
+        # 用 1×1 卷积代替 FC
+        self.conv1 = nn.Conv2d(in_channels, d, kernel_size=1)
+        self.conv2 = nn.Conv2d(d, in_channels * 2, kernel_size=1)
+
+        self.softmax = nn.Softmax(dim=1)
+
+        # 添加残差连接时，如果需要调整维度
+        self.residual_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        # 使用较小的卷积核
+        feat1x1 = self.conv1x1(x)  # 1×1 卷积
+        u = feat1x1  # 你可以在这里加入不同尺度的特征融合策略
+
+        s = self.global_pool(u)  # 全局池化 [B, C, 1, 1]
+        s = F.relu(self.conv1(s))  # 用 1×1 卷积降维
+        a = self.softmax(self.conv2(s).view(s.size(0), 2, -1))  # 用 1×1 卷积升维
+
+        # 加权组合不同感受野的特征
+        output = feat1x1 * a[:, 0, :].view(a.size(0), -1, 1, 1) + feat1x1 * a[:, 1, :].view(a.size(0), -1, 1, 1)
+
+        # 添加残差连接
+        residual = self.residual_conv(feat1x1)
+
+        # 如果输入和输出的形状不同，进行调整
+        if output.shape != residual.shape:
+            residual = F.interpolate(residual, size=output.shape[2:], mode='bilinear', align_corners=False)
+
+        # 返回加上残差的输出
+        return output + residual
+
+
 @ARCH_REGISTRY.register()
-class SVTSCNet(nn.Module):
+class RCANLite(nn.Module):
     def __init__(self,
                  semantic_model_name='resnet50',
                  model_name='clip_nr_koniq_res50',
@@ -418,8 +488,11 @@ class SVTSCNet(nn.Module):
             #conv = SVTFusionModule(in_ch, out_ch, kernel_size=1)  # 使用 1x1 卷积调整通道数
             conv = nn.Conv2d(in_ch, out_ch, kernel_size=1)
             self.convs.append(conv)
-            sca = SCAModule(in_channels=in_ch, reduction_ratio=16)
-            self.sca_modules.append(sca)
+            sk = SCNet(in_channels=in_ch, reduction=16, L=32)
+            self.sca_modules.append(sk)
+
+            #sca = SCAModule(in_channels=in_ch, reduction_ratio=16)
+            #self.sca_modules.append(sca)
         # 对所有卷积层进行初始化
         for conv in self.convs:
             init.kaiming_normal_(conv.weight, mode='fan_out', nonlinearity='relu')

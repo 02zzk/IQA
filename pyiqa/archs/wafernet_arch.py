@@ -31,6 +31,8 @@ import os
 sys.path.append('/data1/zengzk/IQA-PyTorch-main/IQA-PyTorch-main')
 from SAM.segment_anything import sam_model_registry
 from svt.svt import DTCWTForward, DTCWTInverse
+from pyiqa.archs.SCNet.scnet import SCBottleneckAttn
+
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -348,8 +350,78 @@ class SCAModule(nn.Module):
         attention = torch.sigmoid(x)
         return x * attention  # [B, C, H, W]
 
+
+class SKConvNoFC(nn.Module):
+    def __init__(self, in_channels, reduction=16, L=32):
+        super(SKConvNoFC, self).__init__()
+
+        # 尝试减少卷积核大小，改为 1×1 来减少显存消耗
+        self.conv1x1 = nn.Conv2d(in_channels, in_channels, kernel_size=1, padding=0, stride=1)
+
+        d = max(L, in_channels // reduction)
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+
+        # 用 1×1 卷积代替 FC
+        self.conv1 = nn.Conv2d(in_channels, d, kernel_size=1)
+        self.conv2 = nn.Conv2d(d, in_channels * 2, kernel_size=1)
+
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        # 使用较小的卷积核
+        feat1x1 = self.conv1x1(x)  # 1×1 卷积
+        u = feat1x1  # 你可以在这里加入不同尺度的特征融合策略
+
+        s = self.global_pool(u)  # 全局池化 [B, C, 1, 1]
+        s = F.relu(self.conv1(s))  # 用 1×1 卷积降维
+        a = self.softmax(self.conv2(s).view(s.size(0), 2, -1))  # 用 1×1 卷积升维
+
+        # 加权组合不同感受野的特征
+        return feat1x1 * a[:, 0, :].view(a.size(0), -1, 1, 1) + feat1x1 * a[:, 1, :].view(a.size(0), -1, 1, 1)
+
+class SCNet(nn.Module):
+    def __init__(self, in_channels, reduction=16, L=32):
+        super(SCNet, self).__init__()
+        # 尝试减少卷积核大小，改为 1×1 来减少显存消耗
+        self.conv1x1 = nn.Conv2d(in_channels, in_channels, kernel_size=1, padding=0, stride=1)
+
+        d = max(L, in_channels // reduction)
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+
+        # 用 1×1 卷积代替 FC
+        self.conv1 = nn.Conv2d(in_channels, d, kernel_size=1)
+        self.conv2 = nn.Conv2d(d, in_channels * 2, kernel_size=1)
+
+        self.softmax = nn.Softmax(dim=1)
+
+        # 添加残差连接时，如果需要调整维度
+        self.residual_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        # 使用较小的卷积核
+        feat1x1 = self.conv1x1(x)  # 1×1 卷积
+        u = feat1x1  # 你可以在这里加入不同尺度的特征融合策略
+
+        s = self.global_pool(u)  # 全局池化 [B, C, 1, 1]
+        s = F.relu(self.conv1(s))  # 用 1×1 卷积降维
+        a = self.softmax(self.conv2(s).view(s.size(0), 2, -1))  # 用 1×1 卷积升维
+
+        # 加权组合不同感受野的特征
+        output = feat1x1 * a[:, 0, :].view(a.size(0), -1, 1, 1) + feat1x1 * a[:, 1, :].view(a.size(0), -1, 1, 1)
+
+        # 添加残差连接
+        residual = self.residual_conv(feat1x1)
+
+        # 如果输入和输出的形状不同，进行调整
+        if output.shape != residual.shape:
+            residual = F.interpolate(residual, size=output.shape[2:], mode='bilinear', align_corners=False)
+
+        # 返回加上残差的输出
+        return output + residual
+
+
 @ARCH_REGISTRY.register()
-class SVTSCNet(nn.Module):
+class waferNet(nn.Module):
     def __init__(self,
                  semantic_model_name='resnet50',
                  model_name='clip_nr_koniq_res50',
@@ -399,9 +471,6 @@ class SVTSCNet(nn.Module):
         # =============================================================
         # define semantic backbone network
         # =============================================================
-        
-        
-        
         self.svt_modules = nn.ModuleList()  # 用来存储所有的 SVT_channel_mixing 模块
         target_channels = [64, 256, 512, 1024, 2048]  # 5个阶段的 ResNet
         in_channels = [128, 512, 1024, 2048, 4096]
@@ -418,13 +487,25 @@ class SVTSCNet(nn.Module):
             #conv = SVTFusionModule(in_ch, out_ch, kernel_size=1)  # 使用 1x1 卷积调整通道数
             conv = nn.Conv2d(in_ch, out_ch, kernel_size=1)
             self.convs.append(conv)
-            sca = SCAModule(in_channels=in_ch, reduction_ratio=16)
-            self.sca_modules.append(sca)
-        # 对所有卷积层进行初始化
-        for conv in self.convs:
-            init.kaiming_normal_(conv.weight, mode='fan_out', nonlinearity='relu')
-            if conv.bias is not None:
-                init.zeros_(conv.bias)
+            sk = nn.Sequential(SCBottleneckAttn(in_ch, int(in_ch * 0.25), stride=1, norm_layer=nn.BatchNorm2d),
+                               nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, bias=True),
+                               )
+            #sk = SCNet(in_channels=in_ch, reduction=16, L=32)
+            self.sca_modules.append(sk)
+            self.fusion_mlp = nn.Sequential(
+                nn.Linear(2, 16),  # 2 代表 brightness 和 angle
+                nn.ReLU(),
+                nn.Linear(16, 1)  # 输出一个融合权重
+            ).to(device)
+
+            #sca = SCAModule(in_channels=in_ch, reduction_ratio=16)
+            #self.sca_modules.append(sca)
+        # # 对所有卷积层进行初始化
+        # for conv in self.convs:
+        #     init.kaiming_normal_(conv.weight, mode='fan_out', nonlinearity='relu')
+        #     if conv.bias is not None:
+        #         init.zeros_(conv.bias)
+
         # 在初始化时就实例化所有的 SVT_channel_mixing 模块
         for dim in target_channels:
              svt_module = SVT_channel_mixing(dim=dim)
@@ -586,8 +667,6 @@ class SVTSCNet(nn.Module):
 
         return feat_list
 
-
-
     def dist_func(self, x, y, eps=1e-12):
         return torch.sqrt((x - y) ** 2 + eps)
 
@@ -634,13 +713,23 @@ class SVTSCNet(nn.Module):
             feat_combined =torch.cat([feat_svt,feat],dim=1)
             
             feat_weighted = self.sca_modules[i](feat_combined)
-            conv = self.convs[i]
-            conv = conv.to(device)  # 将卷积层移到 GPU 上
-            adjusted_feature = conv(feat_weighted)  # 调整后的特征形状为 [B, out_channels, H, W]
+            #conv = self.convs[i]
+            #conv = conv.to(device)  # 将卷积层移到 GPU 上
+            #adjusted_feature = conv(feat_weighted)  # 调整后的特征形状为 [B, out_channels, H, W]
+
+            # 计算自适应权重
+            fusion_weight = torch.sigmoid(self.fusion_mlp(torch.cat([brightness, angle], dim=1)))
+            # 进行加权融合
+            fusion_weight = fusion_weight.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, height, width)
+            feat_weighted = feat_weighted * (1 + fusion_weight)
+
+            brightness_expanded = brightness.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, height, width)
+            angle_expanded = angle.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, height, width)
+            #feat_weighted = feat_weighted + brightness_expanded * 0.1 + angle_expanded * 0.1
             if torch.var(feat_combined) == 0:
                 print("feat_combined 是常数张量。")
             # 将叠加后的特征存回 dist_feat_list
-            dist_feat_list[i] = adjusted_feature
+            dist_feat_list[i] = feat_weighted
 
         start_level = 0
         end_level = len(dist_feat_list)
@@ -730,13 +819,13 @@ class SVTSCNet(nn.Module):
             else:
                 x = uniform_crop([x], self.crop_size, self.crops)[0]
 
-            #score = self.forward_cross_attention(x, y,brightness, angle)
-            score = self.forward_cross_attention(x, y)
+            score = self.forward_cross_attention(x, y,brightness, angle)
+            #score = self.forward_cross_attention(x, y)
             score = score.reshape(bsz, self.crops, self.num_class)
             score = score.mean(dim=1)
         else:
-            #score = self.forward_cross_attention(x, y,brightness, angle)
-            score = self.forward_cross_attention(x, y)
+            score = self.forward_cross_attention(x, y,brightness, angle)
+            #score = self.forward_cross_attention(x, y)
 
         mos = dist_to_mos(score)
         return_list = []

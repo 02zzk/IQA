@@ -1,4 +1,4 @@
-name: baseline_SVTSCNet_Res50_koniq
+name: baseline_SCNetLite_Res50_wafer
 # name: debug_model
 model_type: GeneralIQAModel
 num_gpu: 4  # set num_gpu: 0 for cpu mode
@@ -9,7 +9,7 @@ define: &img_size [*img_size_oneside, *img_size_oneside]
 
 define: &backbone resnet50
 
-define: &train_batch_size 16
+define: &train_batch_size 8
 define: &test_batch_size 4
 
 # dataset and data loader settings
@@ -17,9 +17,9 @@ datasets:
   train:
     name: koniq10k
     type: GeneralNRDataset
-    dataroot_target: /data1/zengzk/wafer_IQA/wafer_2024/datasets/koniq10k//512x384
-    meta_info_file: /data1/zengzk/wafer_IQA/wafer_2024/datasets/meta_info//meta_info_KonIQ10kDataset.csv
-    split_file: /data1/zengzk/wafer_IQA/wafer_2024/datasets/meta_info//koniq10k_official.pkl
+    dataroot_target: /data1/zengzk/wafer_IQA/wafer_2024/datasets/wafer/512*384
+    meta_info_file: /data1/zengzk/wafer_IQA/wafer_2024/datasets/meta_info/meta_info_waferDataset.csv
+    split_file: /data1/zengzk/wafer_IQA/wafer_2024/datasets/meta_info/wafer_official.pkl
     mos_range: [0, 100]
     lower_better: false 
     mos_normalize: true
@@ -40,13 +40,12 @@ datasets:
   val:
     name: koniq10k
     type: GeneralNRDataset
-    dataroot_target: /data1/zengzk/wafer_IQA/wafer_2024/datasets/koniq10k/512x384
-    meta_info_file: /data1/zengzk/wafer_IQA/wafer_2024/datasets/meta_info/meta_info_KonIQ10kDataset.csv
-    split_file: /data1/zengzk/wafer_IQA/wafer_2024/datasets/meta_info/koniq10k_official.pkl
-
+    dataroot_target: /data1/zengzk/wafer_IQA/wafer_2024/datasets/wafer/512*384
+    meta_info_file: /data1/zengzk/wafer_IQA/wafer_2024/datasets/meta_info/meta_info_waferDataset.csv
+    split_file: /data1/zengzk/wafer_IQA/wafer_2024/datasets/meta_info/wafer_official.pkl
 # network structures
 network:
-  type: SVTSCNet
+  type: SCNetLite
   use_ref: false
   pretrained: false
   num_crop: 1 

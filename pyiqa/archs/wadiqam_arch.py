@@ -22,7 +22,7 @@ from typing import Union, List, cast
 from pyiqa.archs.arch_util import get_url_from_name
 
 default_model_urls = {
-    'wadiqam_fr_kadid': get_url_from_name('WaDIQaM-kadid-f7541ea5.pth'), 
+    'wadiqam_fr_kadid': get_url_from_name('WaDIQaM-kadid-f7541ea5.pth'),
     'wadiqam_nr_koniq': get_url_from_name('WaDIQaM-NR-koniq-aaffea29.pth'),
 }
 
@@ -43,35 +43,15 @@ def make_layers(cfg: List[Union[str, int]]) -> nn.Sequential:
 
 @ARCH_REGISTRY.register()
 class WaDIQaM(nn.Module):
-    """WaDIQaM model.
-    Args:
-        metric_type (String): Choose metric mode.
-        weighted_average (Boolean): Average the weight.
-        train_patch_num (int): Number of patch trained. Default: 32.
-        pretrained_model_path (String): The pretrained model path.
-        load_feature_weight_only (Boolean): Only load featureweight.
-        eps (float): Constant value.
-
-    """
-
-    def __init__(
-        self,
-        metric_type='FR',
-        model_name='wadiqam_fr_kadid',
-        pretrained=True,
-        weighted_average=True,
-        train_patch_num=32,
-        pretrained_model_path=None,
-        load_feature_weight_only=False,
-        eps=1e-8,
-    ):
+    """WaDIQaM model."""
+    def __init__(self, metric_type='FR', pretrained=False, weighted_average=True, train_patch_num=32, pretrained_model_path=None, load_feature_weight_only=False, eps=1e-8):
         super(WaDIQaM, self).__init__()
 
         backbone_cfg = [32, 32, 'M', 64, 64, 'M', 128, 128, 'M', 256, 256, 'M', 512, 512, 'M']
         self.features = make_layers(backbone_cfg)
 
         self.train_patch_num = train_patch_num
-        self.patch_size = 32  # This cannot be changed due to network design
+        self.patch_size = 32
         self.metric_type = metric_type
         fc_in_channel = 512 * 3 if metric_type == 'FR' else 512
         self.eps = eps
@@ -93,11 +73,11 @@ class WaDIQaM(nn.Module):
                 nn.ReLU(True),
             )
 
+        # 去除这部分代码，避免从网上加载预训练权重
         if pretrained_model_path is not None:
             self.load_pretrained_network(pretrained_model_path, load_feature_weight_only)
         elif pretrained:
-            self.metric_type = model_name.split('_')[1].upper()
-            load_pretrained_network(self, default_model_urls[model_name], True, weight_keys='params')
+            pass  # 不再从网络加载预训练权重
 
     def load_pretrained_network(self, model_path, load_feature_weight_only=False):
         print(f'Loading pretrained model from {model_path}')
