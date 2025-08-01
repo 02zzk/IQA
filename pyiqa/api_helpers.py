@@ -1,17 +1,46 @@
 import fnmatch
 import re
+import weakref
 from pyiqa.default_model_configs import DEFAULT_CONFIGS
 from pyiqa.dataset_info import DATASET_INFO
 
 from pyiqa.utils import get_root_logger
-from pyiqa.models.inference_model import InferenceModel
 
+# Global model cache to avoid recreating models
+_model_cache = weakref.WeakValueDictionary()
 
-def create_metric(metric_name, as_loss=False, device=None, **kwargs):
+def create_metric(metric_name, as_loss=False, device=None, use_cache=True, **kwargs):
+    """Create a metric with optional caching for performance.
+    
+    Args:
+        metric_name: Name of the metric to create
+        as_loss: Whether to use as loss
+        device: Device to use
+        use_cache: Whether to use cached models (default: True)
+        **kwargs: Additional arguments
+    """
     assert metric_name in DEFAULT_CONFIGS.keys(), f'Metric {metric_name} not implemented yet.' 
+    
+    # Create cache key based on metric parameters
+    cache_key = (metric_name, as_loss, str(device), frozenset(kwargs.items()) if kwargs else frozenset())
+    
+    # Try to get from cache first if caching is enabled
+    if use_cache and cache_key in _model_cache:
+        logger = get_root_logger()
+        logger.info(f'Using cached metric [{metric_name}].')
+        return _model_cache[cache_key]
+    
+    # Lazy import to avoid loading heavy dependencies at startup
+    from pyiqa.models.inference_model import InferenceModel
+    
     metric = InferenceModel(metric_name, as_loss=as_loss, device=device, **kwargs)
     logger = get_root_logger()
     logger.info(f'Metric [{metric.net.__class__.__name__}] is created.')
+    
+    # Cache the model if caching is enabled and not used as loss
+    if use_cache and not as_loss:
+        _model_cache[cache_key] = metric
+    
     return metric
 
 

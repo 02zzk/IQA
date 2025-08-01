@@ -15,6 +15,20 @@ from huggingface_hub import hf_hub_url
 from .constants import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
 from pyiqa.utils.download_util import load_file_from_url
 
+import weakref
+import os
+from functools import lru_cache
+
+# Cache for loaded state dicts to avoid reloading the same weights
+_state_dict_cache = weakref.WeakValueDictionary()
+
+@lru_cache(maxsize=32)
+def _get_model_info(model_path: str) -> tuple:
+    """Get model file info for caching purposes."""
+    if os.path.exists(model_path):
+        stat = os.stat(model_path)
+        return (model_path, stat.st_size, stat.st_mtime)
+    return (model_path, 0, 0)
 
 # --------------------------------------------
 # IQA utils
@@ -201,15 +215,19 @@ def load_pretrained_network(
     model_path: str, 
     strict: bool = True, 
     weight_keys: str = None,
+    use_cache: bool = True,
+    device: torch.device = None,
 ) -> None:
     """
-    Load a pretrained network from a given model path.
+    Load a pretrained network from a given model path with optimizations.
 
     Args:
         net (torch.nn.Module): The network to load the weights into.
         model_path (str): Path to the model weights file. Can be a URL or a local file path.
         strict (bool, optional): Whether to strictly enforce that the keys in state_dict match the keys returned by net's state_dict(). Default is True.
         weight_keys (str, optional): Specific key to extract from the state_dict. Default is None.
+        use_cache (bool, optional): Whether to use cached state dicts. Default is True.
+        device (torch.device, optional): Device to load weights to. Default is None (use CPU).
 
     Returns:
         None
@@ -218,11 +236,43 @@ def load_pretrained_network(
         model_path = load_file_from_url(model_path)
 
     print(f"Loading pretrained model {net.__class__.__name__} from {model_path}")
-    state_dict = torch.load(model_path, map_location=torch.device("cpu"), weights_only=False)
-    if weight_keys is not None:
-        state_dict = state_dict[weight_keys]
-    state_dict = clean_state_dict(state_dict)
+    
+    # Create cache key
+    model_info = _get_model_info(model_path)
+    cache_key = (model_info, weight_keys)
+    
+    # Try to get from cache first
+    if use_cache and cache_key in _state_dict_cache:
+        state_dict = _state_dict_cache[cache_key]
+        print(f"Using cached state dict for {model_path}")
+    else:
+        # Set device for loading - use CPU by default to save GPU memory
+        map_location = device if device is not None else torch.device("cpu")
+        
+        # Load with optimizations
+        state_dict = torch.load(
+            model_path, 
+            map_location=map_location, 
+            weights_only=False,
+            # Use pickle load optimization
+            pickle_module=None
+        )
+        
+        if weight_keys is not None:
+            state_dict = state_dict[weight_keys]
+        
+        state_dict = clean_state_dict(state_dict)
+        
+        # Cache the state dict if caching is enabled
+        if use_cache:
+            _state_dict_cache[cache_key] = state_dict
+    
+    # Load state dict into the network
     net.load_state_dict(state_dict, strict=strict)
+    
+    # Move to appropriate device if specified and different from current
+    if device is not None and device != next(net.parameters()).device:
+        net.to(device)
 
 
 def _ntuple(n):

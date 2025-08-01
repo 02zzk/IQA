@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from collections import OrderedDict
 from pyiqa.default_model_configs import DEFAULT_CONFIGS
@@ -21,6 +22,8 @@ class InferenceModel(torch.nn.Module):
             device=None,
             seed=123,
             check_input_range=True,
+            enable_mixed_precision=False,
+            memory_efficient=True,
             **kwargs  # Other metric options
     ):
         super(InferenceModel, self).__init__()
@@ -41,14 +44,20 @@ class InferenceModel(torch.nn.Module):
         else:
             self.device = device
         
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        # Optimize CUDNN settings for performance
+        if self.device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True  # Enable for better performance
+            torch.backends.cudnn.deterministic = False  # Disable for speed when not needed for reproducibility
         
         self.as_loss = as_loss
         self.loss_weight = loss_weight
         self.loss_reduction = loss_reduction
         # disable input range check when used as loss
         self.check_input_range = check_input_range if not as_loss else False
+        
+        # Performance optimization options
+        self.enable_mixed_precision = enable_mixed_precision
+        self.memory_efficient = memory_efficient
 
         # =========== define metric model ===============
         net_opts = OrderedDict()
@@ -60,14 +69,28 @@ class InferenceModel(torch.nn.Module):
         net_opts.update(kwargs)
         self.net = build_network(net_opts)
         self.net = self.net.to(self.device)
+        
+        # Set model to eval mode and optimize for inference
         self.net.eval()
+        
+        # Enable optimizations for inference
+        if hasattr(self.net, 'fuse_model'):
+            self.net.fuse_model()  # Fuse conv-bn if available
+        
+        # JIT compile for supported models when not in training mode
+        if not as_loss and hasattr(torch.jit, 'optimize_for_inference'):
+            try:
+                self.net = torch.jit.optimize_for_inference(self.net)
+            except Exception:
+                pass  # Fall back to regular model if JIT optimization fails
 
         self.seed = seed
 
-        self.dummy_param = torch.nn.Parameter(torch.empty(0)).to(self.device)
+        # Use a single parameter to track device instead of dummy tensor
+        self.register_buffer('_device_tracker', torch.empty(0))
     
     def load_weights(self, weights_path, weight_keys='params'):
-        load_pretrained_network(self.net, weights_path, weight_keys=weight_keys)
+        load_pretrained_network(self.net, weights_path, weight_keys=weight_keys, device=self.device)
     
     def is_valid_input(self, x):
         if x is not None:
@@ -78,32 +101,57 @@ class InferenceModel(torch.nn.Module):
             if self.check_input_range:
                 assert x.min() >= 0 and x.max() <= 1, f'Input must be normalized to [0, 1], but got min={x.min():.4f}, max={x.max():.4f}'
     
+    def _preprocess_input(self, target, ref=None):
+        """Optimized input preprocessing with memory efficiency."""
+        device = self._device_tracker.device
+
+        if not torch.is_tensor(target):
+            target = imread2tensor(target, rgb=True)
+            target = target.unsqueeze(0)
+            if self.metric_mode == 'FR':
+                assert ref is not None, 'Please specify reference image for Full Reference metric'
+                ref = imread2tensor(ref, rgb=True)
+                ref = ref.unsqueeze(0)
+                self.is_valid_input(ref)
+        
+        self.is_valid_input(target)
+
+        # Efficient device transfer - only if needed
+        if target.device != device:
+            target = target.to(device, non_blocking=True)
+        
+        if ref is not None and ref.device != device:
+            ref = ref.to(device, non_blocking=True)
+            
+        return target, ref
+    
     def forward(self, target, ref=None, **kwargs):
-        device = self.dummy_param.device
-
+        # Preprocessing
+        target, ref = self._preprocess_input(target, ref)
+        
+        # Memory optimization context
+        if self.memory_efficient and not self.training:
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
         with torch.set_grad_enabled(self.as_loss):
-
-            if self.metric_name == 'fid':
-                output = self.net(target, ref, device=device, **kwargs)
-            elif self.metric_name == 'inception_score':
-                output = self.net(target, device=device, **kwargs)
-            else:
-                if not torch.is_tensor(target):
-                    target = imread2tensor(target, rgb=True)
-                    target = target.unsqueeze(0)
+            # Use mixed precision if enabled and available
+            autocast_context = torch.cuda.amp.autocast() if (
+                self.enable_mixed_precision and 
+                torch.cuda.is_available() and 
+                hasattr(torch.cuda.amp, 'autocast')
+            ) else torch.nullcontext()
+            
+            with autocast_context:
+                if self.metric_name == 'fid':
+                    output = self.net(target, ref, device=self._device_tracker.device, **kwargs)
+                elif self.metric_name == 'inception_score':
+                    output = self.net(target, device=self._device_tracker.device, **kwargs)
+                else:
                     if self.metric_mode == 'FR':
                         assert ref is not None, 'Please specify reference image for Full Reference metric'
-                        ref = imread2tensor(ref, rgb=True)
-                        ref = ref.unsqueeze(0)
-                        self.is_valid_input(ref)
-                
-                self.is_valid_input(target)
-
-                if self.metric_mode == 'FR':
-                    assert ref is not None, 'Please specify reference image for Full Reference metric'
-                    output = self.net(target.to(device), ref.to(device), **kwargs)
-                elif self.metric_mode == 'NR':
-                    output = self.net(target.to(device), **kwargs)
+                        output = self.net(target, ref, **kwargs)
+                    elif self.metric_mode == 'NR':
+                        output = self.net(target, **kwargs)
 
         if self.as_loss:
             if isinstance(output, tuple):
